@@ -1,14 +1,22 @@
 import "dotenv/config";
 import express from "express";
-import { Pool } from "pg";
+import pkg from "pg";
 import cors from "cors";
 import bcrypt from "bcrypt";
 import notifyRoutes from "./emailNotify/notifyRoutes.js";
 import feeRulesRoutes from "./feeRules/feeRules.js";
 import "./emailNotify/dueDateCron.js";
 
+// const port = 5000;
+const port = process.env.PORT || 5000;
+
+console.log("DATABASE_URL exists:", !!process.env.DATABASE_URL);
+if (!process.env.DATABASE_URL) {
+  console.error("❌ DATABASE_URL is missing in .env file");
+  process.exit(1);
+}
 const app = express();
-const port = 5000;
+const { Pool } = pkg;
 
 // Middleware
 app.use(
@@ -23,20 +31,37 @@ app.use(
 app.use(express.json());
 
 // PostgreSQL connection
+// const pool = new Pool({
+//   user: process.env.DB_USER,
+//   host: process.env.DB_HOST,
+//   database: process.env.DB_NAME,
+//   password: process.env.DB_PASSWORD,
+//   port: process.env.DB_PORT,
+// });
+
 const pool = new Pool({
-  user: process.env.DB_USER,
-  host: process.env.DB_HOST,
-  database: process.env.DB_NAME,
-  password: process.env.DB_PASSWORD,
-  port: process.env.DB_PORT,
+  connectionString: process.env.DATABASE_URL.trim(),
+  ssl: {
+    rejectUnauthorized: false,
+  },
 });
+
+pool.on("connect", () => {
+  console.log("✅ Connected to PostgreSQL");
+});
+
+pool.on("error", (err) => {
+  console.error("❌ Unexpected database error:", err.message);
+});
+
 
 // Test database connection
 try {
-  await pool.connect();
-  console.log("Connected to PostgreSQL database");
+  const client = await pool.connect();
+  console.log("✅ Database connection established successfully");
+  client.release();
 } catch (err) {
-  console.error("Database connection error:", err.stack);
+  console.error("❌ Database connection error:", err.message);
   process.exit(1);
 }
 
