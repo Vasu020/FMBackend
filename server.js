@@ -7,16 +7,10 @@ import notifyRoutes from "./emailNotify/notifyRoutes.js";
 import feeRulesRoutes from "./feeRules/feeRules.js";
 import "./emailNotify/dueDateCron.js";
 
-// const port = 5000;
-const port = process.env.PORT || 5000;
 
-console.log("DATABASE_URL exists:", !!process.env.DATABASE_URL);
-if (!process.env.DATABASE_URL) {
-  console.error("❌ DATABASE_URL is missing in .env file");
-  process.exit(1);
-}
-const app = express();
 const { Pool } = pkg;
+const app = express();
+const port = process.env.PORT || 5000;
 
 // Middleware
 app.use(
@@ -25,7 +19,7 @@ app.use(
       "http://localhost:3000",
       "http://localhost:5173",
       "http://localhost:5000",
-      "https://paycampus.vercel.app/"
+      "https://paycampus.vercel.app"
     ],
     credentials: true,
   }),
@@ -40,20 +34,9 @@ app.use(express.json());
 //   password: process.env.DB_PASSWORD,
 //   port: process.env.DB_PORT,
 // });
-
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL.trim(),
-  ssl: {
-    rejectUnauthorized: false,
-  },
-});
-
-pool.on("connect", () => {
-  console.log("✅ Connected to PostgreSQL");
-});
-
-pool.on("error", (err) => {
-  console.error("❌ Unexpected database error:", err.message);
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false } // required on Render
 });
 
 
