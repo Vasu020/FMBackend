@@ -7,26 +7,22 @@ import notifyRoutes from "./emailNotify/notifyRoutes.js";
 import feeRulesRoutes from "./feeRules/feeRules.js";
 import "./emailNotify/dueDateCron.js";
 
-
 const { Pool } = pkg;
 const app = express();
 const port = process.env.PORT || 5000;
 
 // Middleware
-app.use(
-  cors({
-    origin: [
-      "http://localhost:3000",
-      "http://localhost:5173",
-      "http://localhost:5000",
-      "https://paycampus.vercel.app"
-    ],
-    credentials: true,
-  }),
-);
-app.use(express.json());
+// app.use(
+//   cors({
+//     origin: [
+//       "http://localhost:3000",
+//       "http://localhost:5173",
+//       "http://localhost:5000",
+//     ],
+//     credentials: true,
+//   }),
+// );
 
-// PostgreSQL connection
 // const pool = new Pool({
 //   user: process.env.DB_USER,
 //   host: process.env.DB_HOST,
@@ -34,11 +30,14 @@ app.use(express.json());
 //   password: process.env.DB_PASSWORD,
 //   port: process.env.DB_PORT,
 // });
+
+// PostgreSQL connection
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false } // required on Render
-});
+  ssl: { rejectUnauthorized: false }  // ✅ Required for Render Postgres
+});;
 
+app.use(express.json());
 
 // Test database connection
 try {
@@ -734,7 +733,6 @@ app.get("/api/classes", async (req, res) => {
 
 // POST /api/classes — create class linked to a school
 app.post("/api/classes", async (req, res) => {
-
   let {
     school_id,
     classname,
@@ -744,18 +742,20 @@ app.post("/api/classes", async (req, res) => {
     admission,
     annual,
     others,
-    otherCategories = [],     // ← Keep camelCase
+    otherCategories = [], // ← Keep camelCase
   } = req.body;
 
   if (!school_id) {
-    return res.status(400).json({ status: "error", data: null, message: "school_id is required." });
+    return res
+      .status(400)
+      .json({ status: "error", data: null, message: "school_id is required." });
   }
 
   if (!classname || students === undefined || sections === undefined) {
-    return res.status(400).json({ 
-      status: "error", 
-      data: null, 
-      message: "classname, students, and sections are required." 
+    return res.status(400).json({
+      status: "error",
+      data: null,
+      message: "classname, students, and sections are required.",
     });
   }
 
@@ -783,8 +783,8 @@ app.post("/api/classes", async (req, res) => {
         admission,
         annual,
         others,
-        JSON.stringify(otherCategories)   // ← Important: Stringify
-      ]
+        JSON.stringify(otherCategories), // ← Important: Stringify
+      ],
     );
 
     res.status(201).json({
@@ -808,12 +808,18 @@ app.put("/api/classes/:id", async (req, res) => {
   const updates = req.body;
 
   const allowedFields = [
-    "classname", "students", "sections", "tutions",
-    "admission", "annual", "others", "otherCategories"
+    "classname",
+    "students",
+    "sections",
+    "tutions",
+    "admission",
+    "annual",
+    "others",
+    "otherCategories",
   ];
 
   const fieldsToUpdate = Object.keys(updates).filter(
-    (key) => allowedFields.includes(key) && updates[key] !== undefined
+    (key) => allowedFields.includes(key) && updates[key] !== undefined,
   );
 
   if (fieldsToUpdate.length === 0) {
@@ -834,7 +840,7 @@ app.put("/api/classes/:id", async (req, res) => {
 
       if (field === "otherCategories") {
         if (!Array.isArray(value)) value = [];
-        value = JSON.stringify(value);        // Convert array to JSON string
+        value = JSON.stringify(value); // Convert array to JSON string
         setClauses.push(`"otherCategories" = $${paramIndex++}`);
       } else {
         setClauses.push(`"${field}" = $${paramIndex++}`);
@@ -877,92 +883,50 @@ app.put("/api/classes/:id", async (req, res) => {
   }
 });
 
-// --- Settings Table APIs ---
-
-// GET: Fetch all settings
+// GET /api/settings — fetch all settings
 app.get("/api/settings", async (req, res) => {
   try {
-    const result = await pool.query("SELECT * FROM Settings");
-    res.status(200).json({
-      status: "success",
-      data: result.rows,
-      message: "Settings fetched successfully",
-    });
+    const result = await pool.query(
+      "SELECT key, value FROM app_settings ORDER BY id ASC"
+    );
+
+    const settings = result.rows.reduce((acc, row) => {
+      acc[row.key] = row.value;
+      return acc;
+    }, {});
+
+    res.status(200).json({ success: true, data: settings });
   } catch (err) {
-    console.error("GET /api/settings error:", err.stack);
-    res.status(500).json({
-      status: "error",
-      data: null,
-      message: "Failed to fetch settings: " + err.message,
-    });
+    console.error(err);
+    res.status(500).json({ success: false, message: "Internal server error." });
   }
 });
 
-// POST: Create a new setting
-app.post("/api/settings", async (req, res) => {
-  const { DateFormat, Theme } = req.body;
-  try {
-    if (!DateFormat || !Theme) {
-      return res.status(400).json({
-        status: "error",
-        data: null,
-        message: "DateFormat and Theme are required",
-      });
-    }
-    const result = await pool.query(
-      "INSERT INTO Settings (DateFormat, Theme) VALUES ($1, $2) RETURNING *",
-      [DateFormat, Theme],
-    );
-    res.status(201).json({
-      status: "success",
-      data: result.rows[0],
-      message: "Setting created successfully",
-    });
-  } catch (err) {
-    console.error("POST /api/settings error:", err.stack);
-    res.status(500).json({
-      status: "error",
-      data: null,
-      message: "Failed to create setting: " + err.message,
-    });
-  }
-});
+// PUT /api/settings — bulk update all settings at once
+app.put("/api/settings", async (req, res) => {
+  const settings = req.body;
+  // e.g. { date_format: "DD/MM/YYYY", theme: "Light", session_start_month: "4" }
 
-// PUT: Update a setting (assuming single row for simplicity, using ID or unique key if available)
-app.put("/api/settings/:id", async (req, res) => {
-  const { id } = req.params;
-  const { DateFormat, Theme } = req.body;
+  if (!settings || Object.keys(settings).length === 0) {
+    return res.status(400).json({ success: false, message: "No settings provided." });
+  }
+
   try {
-    if (!DateFormat || !Theme) {
-      return res.status(400).json({
-        status: "error",
-        data: null,
-        message: "DateFormat and Theme are required",
-      });
+    await pool.query("BEGIN");
+
+    for (const [key, value] of Object.entries(settings)) {
+      await pool.query(
+        `UPDATE app_settings SET value = $1, updated_at = NOW() WHERE key = $2`,
+        [value, key]
+      );
     }
-    const result = await pool.query(
-      "UPDATE Settings SET DateFormat = $1, Theme = $2 WHERE SettingID = $3 RETURNING *",
-      [DateFormat, Theme, id],
-    );
-    if (result.rowCount === 0) {
-      return res.status(404).json({
-        status: "error",
-        data: null,
-        message: "Setting not found",
-      });
-    }
-    res.status(200).json({
-      status: "success",
-      data: result.rows[0],
-      message: "Setting updated successfully",
-    });
+
+    await pool.query("COMMIT");
+    res.status(200).json({ success: true, message: "Settings saved successfully." });
   } catch (err) {
-    console.error("PUT /api/settings error:", err.stack);
-    res.status(500).json({
-      status: "error",
-      data: null,
-      message: "Failed to update setting: " + err.message,
-    });
+    await pool.query("ROLLBACK");
+    console.error(err);
+    res.status(500).json({ success: false, message: "Internal server error." });
   }
 });
 
