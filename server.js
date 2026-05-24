@@ -11,17 +11,17 @@ const { Pool } = pkg;
 const app = express();
 const port = process.env.PORT || 5000;
 
-// Middleware
-// app.use(
-//   cors({
-//     origin: [
-//       "http://localhost:3000",
-//       "http://localhost:5173",
-//       "http://localhost:5000",
-//     ],
-//     credentials: true,
-//   }),
-// );
+Middleware
+app.use(
+  cors({
+    origin: [
+      "http://localhost:3000",
+      "http://localhost:5173",
+      "http://localhost:5000",
+    ],
+    credentials: true,
+  }),
+);
 
 // const pool = new Pool({
 //   user: process.env.DB_USER,
