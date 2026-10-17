@@ -6,12 +6,76 @@ import bcrypt from "bcrypt";
 import notifyRoutes from "./emailNotify/notifyRoutes.js";
 import feeRulesRoutes from "./feeRules/feeRules.js";
 import "./emailNotify/dueDateCron.js";
+import { generateToken, authenticateToken, requireAdmin } from "./auth.js";
 
 const { Pool } = pkg;
 const app = express();
-const port = process.env.PORT || 5000;
+const port = process.env.PORT || 5000 || 5173;
 
-Middleware
+// PostgreSQL connection
+const pool = new Pool({
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
+  port: process.env.DB_PORT,
+});
+
+function calculateAccruedLateFees(dueDate, feeRule, now = new Date()) {
+  if (!feeRule || !feeRule.is_active) return 0;
+
+  const monthlyAmount = Number(feeRule.late_fee_amount) || 0;
+  const dueDay = Math.max(1, Number(feeRule.due_day_of_month) || 1);
+  const graceDays = Math.max(0, Number(feeRule.grace_days) || 0);
+  if (monthlyAmount <= 0) return 0;
+
+  let due;
+  if (dueDate) {
+    const datePart = String(dueDate).slice(0, 10);
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(datePart);
+    if (!match) return 0;
+    due = new Date(
+      Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])),
+    );
+  } else {
+    const lastDay = new Date(
+      Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 0),
+    ).getUTCDate();
+    due = new Date(
+      Date.UTC(
+        now.getUTCFullYear(),
+        now.getUTCMonth(),
+        Math.min(dueDay, lastDay),
+      ),
+    );
+  }
+
+  const graceDeadline = new Date(due);
+  graceDeadline.setUTCDate(graceDeadline.getUTCDate() + graceDays);
+  const today = new Date(
+    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()),
+  );
+  if (today <= graceDeadline) return 0;
+
+  let periods = 1;
+  for (let offset = 1; offset <= 1200; offset += 1) {
+    const month = graceDeadline.getUTCMonth() + offset;
+    const year =
+      graceDeadline.getUTCFullYear() + Math.floor(month / 12);
+    const monthIndex = month % 12;
+    const anchorDay = graceDeadline.getUTCDate();
+    const lastDay = new Date(Date.UTC(year, monthIndex + 1, 0)).getUTCDate();
+    const anniversary = new Date(
+      Date.UTC(year, monthIndex, Math.min(anchorDay, lastDay)),
+    );
+    if (anniversary > today) break;
+    periods += 1;
+  }
+
+  return Math.round(periods * monthlyAmount * 100) / 100;
+}
+
+// Middleware
 app.use(
   cors({
     origin: [
@@ -20,22 +84,8 @@ app.use(
       "http://localhost:5000",
     ],
     credentials: true,
-  }),
+  })
 );
-
-// const pool = new Pool({
-//   user: process.env.DB_USER,
-//   host: process.env.DB_HOST,
-//   database: process.env.DB_NAME,
-//   password: process.env.DB_PASSWORD,
-//   port: process.env.DB_PORT,
-// });
-
-// PostgreSQL connection
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }  // ✅ Required for Render Postgres
-});;
 
 app.use(express.json());
 
@@ -44,14 +94,34 @@ try {
   const client = await pool.connect();
   console.log("✅ Database connection established successfully");
   client.release();
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS student_late_fee_payments (
+      id BIGSERIAL PRIMARY KEY,
+      student_id INTEGER NOT NULL REFERENCES students(student_id) ON DELETE CASCADE,
+      school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+      amount NUMERIC(12, 2) NOT NULL CHECK (amount > 0),
+      payment_date DATE NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_student_late_fee_payments_student_school
+    ON student_late_fee_payments (student_id, school_id)
+  `);
 } catch (err) {
   console.error("❌ Database connection error:", err.message);
   process.exit(1);
 }
 
-// GET /api/schools/:id — Get school by ID
-app.get("/api/schools/:id", async (req, res) => {
+// ─────────────────────────────────────────
+// GET /api/schools/:id — Get school by ID (auth required, must be your own school)
+// ─────────────────────────────────────────
+app.get("/api/schools/:id", authenticateToken, async (req, res) => {
   const { id } = req.params;
+
+  if (Number(id) !== req.user.school_id) {
+    return res.status(403).json({ message: "Forbidden." });
+  }
 
   try {
     const result = await pool.query(
@@ -69,47 +139,52 @@ app.get("/api/schools/:id", async (req, res) => {
     res.status(500).json({ message: "Internal server error" });
   }
 });
-// POST /api/schools/ — Create a new school
+
+// ─────────────────────────────────────────
+// POST /api/schools/ — Register a new school (public — no token yet)
+// ─────────────────────────────────────────
 app.post("/api/schools", async (req, res) => {
-  const { school_name, short_name, email, password, phone } = req.body;
+  const { school_name, short_name, email, password } = req.body;
 
   if (!school_name || !email || !password) {
     return res
       .status(400)
       .json({ message: "school_name, email, and password are required." });
   }
-
   if (password.length < 8) {
     return res
       .status(400)
       .json({ message: "Password must be at least 8 characters." });
   }
 
+  const client = await pool.connect();
   try {
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    // Step 1 — Create the school
-    const schoolResult = await pool.query(
+    await client.query("BEGIN");
+
+    const schoolResult = await client.query(
       `INSERT INTO schools (school_name, short_name, email)
        VALUES ($1, $2, $3)
        RETURNING id, school_name, short_name, email, created_at`,
       [school_name, short_name, email],
     );
-
     const school = schoolResult.rows[0];
 
-    // Step 2 — Admin user is the single source of truth for auth
-    await pool.query(
+    await client.query(
       `INSERT INTO users (school_id, name, email, password, role)
        VALUES ($1, $2, $3, $4, 'admin')`,
       [school.id, school_name, email, hashedPassword],
     );
+
+    await client.query("COMMIT");
 
     res.status(201).json({
       message: "School registered successfully. You can now log in.",
       school,
     });
   } catch (err) {
+    await client.query("ROLLBACK");
     console.error(err);
     if (err.code === "23505") {
       return res
@@ -117,10 +192,14 @@ app.post("/api/schools", async (req, res) => {
         .json({ message: "This email is already registered." });
     }
     res.status(500).json({ message: "Internal server error." });
+  } finally {
+    client.release();
   }
 });
 
-// POST /api/schools/login
+// ─────────────────────────────────────────
+// POST /api/schools/login — issues a JWT
+// ─────────────────────────────────────────
 app.post("/api/schools/login", async (req, res) => {
   const { email, password } = req.body;
 
@@ -145,8 +224,6 @@ app.post("/api/schools/login", async (req, res) => {
     }
 
     const school = result.rows[0];
-
-    // Compare entered password with hashed password in DB
     const isMatch = await bcrypt.compare(password, school.password);
 
     if (!isMatch) {
@@ -155,9 +232,16 @@ app.post("/api/schools/login", async (req, res) => {
         .json({ message: "Invalid credentials. Please try again." });
     }
 
-    // Return safe school info (never return password)
+    const token = generateToken({
+      id: school.id,
+      school_id: school.id,
+      role: "admin",
+      email: school.email,
+    });
+
     res.status(200).json({
       message: "Login successful.",
+      token,
       school: {
         id: school.id,
         school_name: school.school_name,
@@ -171,7 +255,9 @@ app.post("/api/schools/login", async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────
 // POST /api/users/reset-password
+// ─────────────────────────────────────────
 app.post("/api/users/reset-password", async (req, res) => {
   const { email, password } = req.body;
 
@@ -213,8 +299,7 @@ app.post("/api/users/reset-password", async (req, res) => {
 });
 
 // ─────────────────────────────────────────
-// POST /api/users/login
-// Login for both admin and non-admin users
+// POST /api/users/login — issues a JWT
 // ─────────────────────────────────────────
 app.post("/api/users/login", async (req, res) => {
   const { email, password } = req.body;
@@ -250,8 +335,16 @@ app.post("/api/users/login", async (req, res) => {
         .json({ message: "Invalid credentials. Please try again." });
     }
 
+    const token = generateToken({
+      id: user.id,
+      school_id: user.school_id,
+      role: user.role,
+      email: user.email,
+    });
+
     res.status(200).json({
       message: "Login successful.",
+      token,
       user: {
         id: user.id,
         name: user.name,
@@ -264,24 +357,23 @@ app.post("/api/users/login", async (req, res) => {
     });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ message: "Internal server error." });
+   res.status(500).json({ message: "Internal server error.", detail: err.message, code: err.code });
   }
 });
 
 // ─────────────────────────────────────────
-// POST /api/users
-// Admin creates a new non-admin user under their school
+// POST /api/users — Admin creates a new non-admin user under THEIR OWN school
 // ─────────────────────────────────────────
-app.post("/api/users", async (req, res) => {
-  const { school_id, name, email, password, role } = req.body;
+app.post("/api/users", authenticateToken, requireAdmin, async (req, res) => {
+  const { name, email, password, role } = req.body;
+  const school_id = req.user.school_id; // never trust client-supplied school_id here
 
-  if (!school_id || !name || !email || !password) {
+  if (!name || !email || !password) {
     return res
       .status(400)
-      .json({ message: "school_id, name, email, and password are required." });
+      .json({ message: "name, email, and password are required." });
   }
 
-  // Only allow 'user' role to be created this way (admin is created via school registration)
   const assignedRole = role === "admin" ? "admin" : "user";
 
   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -321,15 +413,10 @@ app.post("/api/users", async (req, res) => {
 });
 
 // ─────────────────────────────────────────
-// GET /api/users?school_id=1
-// Get all users under a school (admin only)
+// GET /api/users — Get all users under YOUR school (admin only)
 // ─────────────────────────────────────────
-app.get("/api/users", async (req, res) => {
-  const { school_id } = req.query;
-
-  if (!school_id) {
-    return res.status(400).json({ message: "school_id is required." });
-  }
+app.get("/api/users", authenticateToken, requireAdmin, async (req, res) => {
+  const school_id = req.user.school_id;
 
   try {
     const result = await pool.query(
@@ -349,14 +436,21 @@ app.get("/api/users", async (req, res) => {
 });
 
 // ─────────────────────────────────────────
-// DELETE /api/users/:id
-// Admin deletes a user
+// DELETE /api/users/:id — Admin deletes a user (must belong to the same school)
 // ─────────────────────────────────────────
-app.delete("/api/users/:id", async (req, res) => {
+app.delete("/api/users/:id", authenticateToken, requireAdmin, async (req, res) => {
   const { id } = req.params;
 
   try {
-    await pool.query("DELETE FROM users WHERE id = $1", [id]);
+    const result = await pool.query(
+      "DELETE FROM users WHERE id = $1 AND school_id = $2 RETURNING id",
+      [id, req.user.school_id],
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: "User not found." });
+    }
+
     res.status(200).json({ message: "User deleted successfully." });
   } catch (err) {
     console.error(err);
@@ -365,18 +459,10 @@ app.delete("/api/users/:id", async (req, res) => {
 });
 
 // ─────────────────────────────────────────
-// GET /api/students
+// GET /api/students — always scoped to the caller's school
 // ─────────────────────────────────────────
-app.get("/api/students", async (req, res) => {
-  const { school_id } = req.query; // passed as ?school_id=1
-
-  if (!school_id) {
-    return res.status(400).json({
-      status: "error",
-      data: null,
-      message: "school_id is required.",
-    });
-  }
+app.get("/api/students", authenticateToken, async (req, res) => {
+  const school_id = req.user.school_id;
 
   try {
     const result = await pool.query(
@@ -400,12 +486,11 @@ app.get("/api/students", async (req, res) => {
 });
 
 // ─────────────────────────────────────────
-// POST /api/students — add student with school_id
+// POST /api/students — add student; school_id always comes from the token
 // ─────────────────────────────────────────
-
-app.post("/api/students", async (req, res) => {
+app.post("/api/students", authenticateToken, async (req, res) => {
+  const school_id = req.user.school_id;
   const {
-    school_id, // ← new
     first_name,
     last_name,
     father_name,
@@ -427,15 +512,6 @@ app.post("/api/students", async (req, res) => {
     standard,
   } = req.body;
 
-  // Validate required fields
-  if (!school_id) {
-    return res.status(400).json({
-      status: "error",
-      data: null,
-      message: "school_id is required.",
-    });
-  }
-
   if (!first_name || !father_name || !email) {
     return res.status(400).json({
       status: "error",
@@ -444,7 +520,6 @@ app.post("/api/students", async (req, res) => {
     });
   }
 
-  // Validate email format
   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
   if (!emailRegex.test(email)) {
     return res.status(400).json({
@@ -454,7 +529,6 @@ app.post("/api/students", async (req, res) => {
     });
   }
 
-  // Validate numeric fields
   const numericFields = {
     total_fees,
     fees_paid,
@@ -483,10 +557,10 @@ app.post("/api/students", async (req, res) => {
       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
       RETURNING *`,
       [
-        school_id, // $1 ← new
-        first_name, // $2
-        last_name, // $3
-        father_name, // $4
+        school_id,
+        first_name,
+        last_name,
+        father_name,
         date_of_birth || null,
         gender || null,
         contact_phone || null,
@@ -524,16 +598,18 @@ app.post("/api/students", async (req, res) => {
   }
 });
 
-// PUT: Update a student by ID
-app.put("/api/students/:id", async (req, res) => {
+// ─────────────────────────────────────────
+// PUT /api/students/:id — update, scoped to the caller's school
+// ─────────────────────────────────────────
+app.put("/api/students/:id", authenticateToken, async (req, res) => {
   const { id } = req.params;
+  const school_id = req.user.school_id;
 
-  // ── 1. Fetch existing student ──────────────────────────────────────────────
   let existing;
   try {
     const existing_result = await pool.query(
-      "SELECT * FROM students WHERE student_id = $1",
-      [id],
+      "SELECT * FROM students WHERE student_id = $1 AND school_id = $2",
+      [id, school_id],
     );
     if (existing_result.rows.length === 0) {
       return res.status(404).json({
@@ -551,7 +627,6 @@ app.put("/api/students/:id", async (req, res) => {
     });
   }
 
-  // ── 2. Merge incoming fields over existing values ──────────────────────────
   const body = req.body;
 
   const first_name = body.first_name ?? existing.first_name;
@@ -576,7 +651,6 @@ app.put("/api/students/:id", async (req, res) => {
   const roll_no = body.roll_no ?? existing.roll_no;
   const standard = body.standard ?? existing.standard;
 
-  // ── 3. Validate required fields (now always satisfied via merge) ───────────
   if (!first_name || !father_name || !email) {
     return res.status(400).json({
       status: "error",
@@ -585,7 +659,6 @@ app.put("/api/students/:id", async (req, res) => {
     });
   }
 
-  // ── 4. Validate email format ───────────────────────────────────────────────
   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
   if (!emailRegex.test(email)) {
     return res.status(400).json({
@@ -595,7 +668,6 @@ app.put("/api/students/:id", async (req, res) => {
     });
   }
 
-  // ── 5. Validate numeric fields (FIXED: only reject truly non-numeric) ──────
   const numericFields = {
     total_fees,
     fees_paid,
@@ -615,7 +687,6 @@ app.put("/api/students/:id", async (req, res) => {
     }
   }
 
-  // ── 6. Run the update ──────────────────────────────────────────────────────
   try {
     const result = await pool.query(
       `UPDATE students SET
@@ -624,7 +695,7 @@ app.put("/api/students/:id", async (req, res) => {
         late_fees_charges = $11, concession = $12, scholarship = $13,
         last_payment_date = $14, due_date = $15, enrollment_date = $16,
         status = $17, roll_no = $18, standard = $19
-      WHERE student_id = $20 RETURNING *`,
+      WHERE student_id = $20 AND school_id = $21 RETURNING *`,
       [
         first_name,
         last_name || null,
@@ -646,6 +717,7 @@ app.put("/api/students/:id", async (req, res) => {
         roll_no || null,
         standard || null,
         id,
+        school_id,
       ],
     );
 
@@ -666,13 +738,16 @@ app.put("/api/students/:id", async (req, res) => {
     });
   }
 });
-// DELETE: Remove a student by ID
-app.delete("/api/students/:id", async (req, res) => {
+
+// ─────────────────────────────────────────
+// DELETE /api/students/:id — scoped to the caller's school
+// ─────────────────────────────────────────
+app.delete("/api/students/:id", authenticateToken, async (req, res) => {
   const { id } = req.params;
   try {
     const result = await pool.query(
-      "DELETE FROM students WHERE student_id = $1 RETURNING *",
-      [id],
+      "DELETE FROM students WHERE student_id = $1 AND school_id = $2 RETURNING *",
+      [id, req.user.school_id],
     );
     if (result.rows.length === 0) {
       return res.status(404).json({
@@ -698,17 +773,11 @@ app.delete("/api/students/:id", async (req, res) => {
 
 // --- Class Table APIs ---
 
-// GET /api/classes — fetch only classes belonging to the school
-app.get("/api/classes", async (req, res) => {
-  const { school_id } = req.query; // ?school_id=1
-
-  if (!school_id) {
-    return res.status(400).json({
-      status: "error",
-      data: null,
-      message: "school_id is required.",
-    });
-  }
+// ─────────────────────────────────────────
+// GET /api/classes — scoped to the caller's school
+// ─────────────────────────────────────────
+app.get("/api/classes", authenticateToken, async (req, res) => {
+  const school_id = req.user.school_id;
 
   try {
     const result = await pool.query(
@@ -731,10 +800,12 @@ app.get("/api/classes", async (req, res) => {
   }
 });
 
-// POST /api/classes — create class linked to a school
-app.post("/api/classes", async (req, res) => {
+// ─────────────────────────────────────────
+// POST /api/classes — create class linked to the caller's school
+// ─────────────────────────────────────────
+app.post("/api/classes", authenticateToken, async (req, res) => {
+  const school_id = req.user.school_id;
   let {
-    school_id,
     classname,
     students,
     sections,
@@ -742,14 +813,8 @@ app.post("/api/classes", async (req, res) => {
     admission,
     annual,
     others,
-    otherCategories = [], // ← Keep camelCase
+    otherCategories = [],
   } = req.body;
-
-  if (!school_id) {
-    return res
-      .status(400)
-      .json({ status: "error", data: null, message: "school_id is required." });
-  }
 
   if (!classname || students === undefined || sections === undefined) {
     return res.status(400).json({
@@ -759,13 +824,11 @@ app.post("/api/classes", async (req, res) => {
     });
   }
 
-  // Default values
   tutions = tutions ?? 0;
   admission = admission ?? 0;
   annual = annual ?? 0;
   others = others ?? 0;
 
-  // Ensure otherCategories is array
   if (!Array.isArray(otherCategories)) otherCategories = [];
 
   try {
@@ -783,7 +846,7 @@ app.post("/api/classes", async (req, res) => {
         admission,
         annual,
         others,
-        JSON.stringify(otherCategories), // ← Important: Stringify
+        JSON.stringify(otherCategories),
       ],
     );
 
@@ -802,9 +865,12 @@ app.post("/api/classes", async (req, res) => {
   }
 });
 
-// PUT: Update an existing class by id
-app.put("/api/classes/:id", async (req, res) => {
+// ─────────────────────────────────────────
+// PUT /api/classes/:id — update, scoped to the caller's school
+// ─────────────────────────────────────────
+app.put("/api/classes/:id", authenticateToken, async (req, res) => {
   const { id } = req.params;
+  const school_id = req.user.school_id;
   const updates = req.body;
 
   const allowedFields = [
@@ -840,7 +906,7 @@ app.put("/api/classes/:id", async (req, res) => {
 
       if (field === "otherCategories") {
         if (!Array.isArray(value)) value = [];
-        value = JSON.stringify(value); // Convert array to JSON string
+        value = JSON.stringify(value);
         setClauses.push(`"otherCategories" = $${paramIndex++}`);
       } else {
         setClauses.push(`"${field}" = $${paramIndex++}`);
@@ -849,12 +915,12 @@ app.put("/api/classes/:id", async (req, res) => {
       values.push(value);
     }
 
-    values.push(id);
+    values.push(id, school_id);
 
     const queryText = `
       UPDATE classes 
       SET ${setClauses.join(", ")}
-      WHERE id = $${values.length}
+      WHERE id = $${values.length - 1} AND school_id = $${values.length}
       RETURNING *
     `;
 
@@ -883,8 +949,10 @@ app.put("/api/classes/:id", async (req, res) => {
   }
 });
 
-// GET /api/settings — fetch all settings
-app.get("/api/settings", async (req, res) => {
+// ─────────────────────────────────────────
+// GET /api/settings — admin only
+// ─────────────────────────────────────────
+app.get("/api/settings", authenticateToken, requireAdmin, async (req, res) => {
   try {
     const result = await pool.query(
       "SELECT key, value FROM app_settings ORDER BY id ASC"
@@ -902,10 +970,11 @@ app.get("/api/settings", async (req, res) => {
   }
 });
 
-// PUT /api/settings — bulk update all settings at once
-app.put("/api/settings", async (req, res) => {
+// ─────────────────────────────────────────
+// PUT /api/settings — admin only
+// ─────────────────────────────────────────
+app.put("/api/settings", authenticateToken, requireAdmin, async (req, res) => {
   const settings = req.body;
-  // e.g. { date_format: "DD/MM/YYYY", theme: "Light", session_start_month: "4" }
 
   if (!settings || Object.keys(settings).length === 0) {
     return res.status(400).json({ success: false, message: "No settings provided." });
@@ -930,9 +999,9 @@ app.put("/api/settings", async (req, res) => {
   }
 });
 
-app.use("/api/notify", notifyRoutes);
+app.use("/api/notify", authenticateToken, notifyRoutes);
 
-app.use("/api/fee-rules", feeRulesRoutes);
+app.use("/api/fee-rules", authenticateToken, feeRulesRoutes);
 
 // Start the server
 app.listen(port, () => {
