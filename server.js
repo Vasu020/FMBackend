@@ -95,18 +95,9 @@ try {
   console.log("✅ Database connection established successfully");
   client.release();
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS student_late_fee_payments (
-      id BIGSERIAL PRIMARY KEY,
-      student_id INTEGER NOT NULL REFERENCES students(student_id) ON DELETE CASCADE,
-      school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
-      amount NUMERIC(12, 2) NOT NULL CHECK (amount > 0),
-      payment_date DATE NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_student_late_fee_payments_student_school
-    ON student_late_fee_payments (student_id, school_id)
+    ALTER TABLE students
+      ADD COLUMN IF NOT EXISTS late_fees_paid NUMERIC(12, 2) NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS last_late_fee_payment_date DATE
   `);
 } catch (err) {
   console.error("❌ Database connection error:", err.message);
@@ -465,14 +456,38 @@ app.get("/api/students", authenticateToken, async (req, res) => {
   const school_id = req.user.school_id;
 
   try {
-    const result = await pool.query(
-      "SELECT * FROM students WHERE school_id = $1 ORDER BY student_id ASC",
-      [school_id],
-    );
+    const [studentsResult, ruleResult] = await Promise.all([
+      pool.query(
+        "SELECT * FROM students WHERE school_id = $1 ORDER BY student_id ASC",
+        [school_id],
+      ),
+      pool.query(
+        `SELECT due_day_of_month, grace_days, late_fee_amount, is_active
+         FROM fee_rules
+         WHERE rule_type = 'late_fee' AND is_active = true
+         ORDER BY created_at DESC
+         LIMIT 1`,
+      ),
+    ]);
+
+    const feeRule = ruleResult.rows[0] ?? null;
+    const students = studentsResult.rows.map((student) => {
+      const accruedFees = Math.max(
+        Number(student.late_fees_charges) || 0,
+        calculateAccruedLateFees(student.due_date, feeRule),
+      );
+      const paidFees = Math.max(Number(student.late_fees_paid) || 0, 0);
+      return {
+        ...student,
+        late_fees_charges: accruedFees,
+        late_fees_paid: paidFees,
+        late_fees_balance: Math.max(accruedFees - paidFees, 0),
+      };
+    });
 
     res.status(200).json({
       status: "success",
-      data: result.rows,
+      data: students,
       message: "Students fetched successfully",
     });
   } catch (err) {
@@ -484,6 +499,116 @@ app.get("/api/students", authenticateToken, async (req, res) => {
     });
   }
 });
+
+// ─────────────────────────────────────────
+// POST /api/students/:id/late-fee-payments — update the student's late-fee total
+// ─────────────────────────────────────────
+app.post(
+  "/api/students/:id/late-fee-payments",
+  authenticateToken,
+  async (req, res) => {
+    const { id } = req.params;
+    const school_id = req.user.school_id;
+    const amount = Number(req.body.amount);
+    const paymentDate = req.body.payment_date;
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({
+        status: "error",
+        message: "Payment amount must be greater than zero.",
+      });
+    }
+    if (
+      typeof paymentDate !== "string" ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(paymentDate) ||
+      Number.isNaN(Date.parse(`${paymentDate}T00:00:00Z`))
+    ) {
+      return res.status(400).json({
+        status: "error",
+        message: "A valid payment date is required.",
+      });
+    }
+    if (paymentDate > new Date().toISOString().slice(0, 10)) {
+      return res.status(400).json({
+        status: "error",
+        message: "Payment date cannot be in the future.",
+      });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const studentResult = await client.query(
+        `SELECT * FROM students
+         WHERE student_id = $1 AND school_id = $2
+         FOR UPDATE`,
+        [id, school_id],
+      );
+      if (studentResult.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({
+          status: "error",
+          message: "Student not found.",
+        });
+      }
+
+      const student = studentResult.rows[0];
+      const ruleResult = await client.query(
+        `SELECT due_day_of_month, grace_days, late_fee_amount, is_active
+         FROM fee_rules
+         WHERE rule_type = 'late_fee' AND is_active = true
+         ORDER BY created_at DESC
+         LIMIT 1`,
+      );
+      const accruedFees = Math.max(
+        Number(student.late_fees_charges) || 0,
+        calculateAccruedLateFees(student.due_date, ruleResult.rows[0] ?? null),
+      );
+      const paidBefore = Math.max(Number(student.late_fees_paid) || 0, 0);
+      const pending = Math.max(accruedFees - paidBefore, 0);
+
+      if (amount > pending) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          status: "error",
+          message: `Payment exceeds the pending late fee of ${pending.toFixed(2)}.`,
+        });
+      }
+
+      const paidAfter = Math.round((paidBefore + amount) * 100) / 100;
+      const updateResult = await client.query(
+        `UPDATE students
+         SET late_fees_paid = $1, last_late_fee_payment_date = $2
+         WHERE student_id = $3 AND school_id = $4
+         RETURNING late_fees_paid, last_late_fee_payment_date`,
+        [paidAfter, paymentDate, id, school_id],
+      );
+
+      await client.query("COMMIT");
+      return res.status(201).json({
+        status: "success",
+        data: {
+          student_id: Number(id),
+          late_fees_charges: accruedFees,
+          late_fees_paid: Number(updateResult.rows[0].late_fees_paid),
+          late_fees_balance: Math.max(accruedFees - paidAfter, 0),
+          last_late_fee_payment_date:
+            updateResult.rows[0].last_late_fee_payment_date,
+        },
+        message: "Late-fee payment recorded.",
+      });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error("POST /api/students/:id/late-fee-payments error:", err);
+      return res.status(500).json({
+        status: "error",
+        message: "Failed to record late-fee payment.",
+      });
+    } finally {
+      client.release();
+    }
+  },
+);
 
 // ─────────────────────────────────────────
 // POST /api/students — add student; school_id always comes from the token
@@ -502,6 +627,8 @@ app.post("/api/students", authenticateToken, async (req, res) => {
     fees_paid,
     balance,
     late_fees_charges,
+    late_fees_paid,
+    last_late_fee_payment_date,
     concession,
     scholarship,
     last_payment_date,
@@ -534,6 +661,7 @@ app.post("/api/students", authenticateToken, async (req, res) => {
     fees_paid,
     balance,
     late_fees_charges,
+    late_fees_paid,
     concession,
     scholarship,
   };
@@ -552,9 +680,10 @@ app.post("/api/students", authenticateToken, async (req, res) => {
       `INSERT INTO students (
         school_id,
         first_name, last_name, father_name, date_of_birth, gender, contact_phone, email,
-        total_fees, fees_paid, balance, late_fees_charges, concession, scholarship,
+        total_fees, fees_paid, balance, late_fees_charges, late_fees_paid,
+        last_late_fee_payment_date, concession, scholarship,
         last_payment_date, due_date, enrollment_date, status, roll_no, standard
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
       RETURNING *`,
       [
         school_id,
@@ -569,6 +698,8 @@ app.post("/api/students", authenticateToken, async (req, res) => {
         Number(fees_paid) || 0,
         Number(balance) || 0,
         Number(late_fees_charges) || 0,
+        Number(late_fees_paid) || 0,
+        last_late_fee_payment_date || null,
         Number(concession) || 0,
         Number(scholarship) || 0,
         last_payment_date || null,
@@ -641,6 +772,9 @@ app.put("/api/students/:id", authenticateToken, async (req, res) => {
   const balance = body.balance ?? existing.balance;
   const late_fees_charges =
     body.late_fees_charges ?? existing.late_fees_charges;
+  const late_fees_paid = existing.late_fees_paid ?? 0;
+  const last_late_fee_payment_date =
+    existing.last_late_fee_payment_date ?? null;
   const concession = body.concession ?? existing.concession;
   const scholarship = body.scholarship ?? existing.scholarship;
   const last_payment_date =
@@ -673,6 +807,7 @@ app.put("/api/students/:id", authenticateToken, async (req, res) => {
     fees_paid,
     balance,
     late_fees_charges,
+    late_fees_paid,
     concession,
     scholarship,
     roll_no,
@@ -692,10 +827,11 @@ app.put("/api/students/:id", authenticateToken, async (req, res) => {
       `UPDATE students SET
         first_name = $1, last_name = $2, father_name = $3, date_of_birth = $4, gender = $5,
         contact_phone = $6, email = $7, total_fees = $8, fees_paid = $9, balance = $10,
-        late_fees_charges = $11, concession = $12, scholarship = $13,
-        last_payment_date = $14, due_date = $15, enrollment_date = $16,
-        status = $17, roll_no = $18, standard = $19
-      WHERE student_id = $20 AND school_id = $21 RETURNING *`,
+        late_fees_charges = $11, late_fees_paid = $12,
+        last_late_fee_payment_date = $13, concession = $14, scholarship = $15,
+        last_payment_date = $16, due_date = $17, enrollment_date = $18,
+        status = $19, roll_no = $20, standard = $21
+      WHERE student_id = $22 AND school_id = $23 RETURNING *`,
       [
         first_name,
         last_name || null,
@@ -708,6 +844,8 @@ app.put("/api/students/:id", authenticateToken, async (req, res) => {
         Number(fees_paid) || 0,
         Number(balance) || 0,
         Number(late_fees_charges) || 0,
+        Number(late_fees_paid) || 0,
+        last_late_fee_payment_date,
         Number(concession) || 0,
         Number(scholarship) || 0,
         last_payment_date || null,
